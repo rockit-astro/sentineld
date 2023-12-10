@@ -19,7 +19,7 @@ import datetime
 import threading
 import urllib.request
 import Pyro4
-import xmltodict
+import xml.etree.ElementTree as ET
 from rockit.common import daemons, log
 
 SENTINEL_URI = 'http://10.2.5.16:5000/status'
@@ -52,71 +52,62 @@ class SentinelDaemon:
         try:
             with urllib.request.urlopen(SENTINEL_URI, timeout=QUERY_TIMEOUT) as response:
                 sentinel_string = response.read()
-                sentinel = xmltodict.parse(sentinel_string)['status']
+                tree = ET.fromstring(sentinel_string)
 
             # work out timestamp of data
-            tsample = sentinel['weather']['tsample']
-            utc = datetime.timezone.utc
-            date = datetime.datetime.strptime(tsample, '%Y-%m-%d %H:%M:%S%z').astimezone(utc)
-
-            # build up the json blob
-            weather = sentinel['weather']
-            roof = sentinel['roof']
+            date = datetime.datetime.strptime(tree.find('./weather/tsample').text, '%Y-%m-%d %H:%M:%S')
 
             # combine rg11 sensors
             rg11_total = 0
-            rg11s = [1, 2, 4]
+            rg11s = [1, 2, 4]  # Only some of the sensors are connected
             for r in rg11s:
-                rg11_total += int(weather[f'rg11_{r:02d}'])
+                rg11_total += int(tree.find(f'./weather/rg11_{r:02d}').text)
             rg11_unsafe = 1 if rg11_total > 0 else 0
-            n_rg11 = len(rg11s)
 
             # determine roof status
-            roof_state = roof['state']
+            roof_state = tree.find('./roof/state').text
             if roof_state == "FULL CLOSED":
                 closed = True
             else:
                 closed = False
 
-            ret = {"date": date,
-                   "wind_dir": weather['wind_dir'],
-                   "wind_dir_valid": True,
-                   "wind_speed": weather['wind_speed_avg'],
-                   "wind_speed_valid": True,
-                   "temperature": weather['temperature'],
-                   "temperature_valid": True,
-                   "relative_humidity": weather['humidity'],
-                   "relative_humidity_valid": True,
-                   "pressure": weather['pressure'],
-                   "pressure_valid": True,
-                   "accumulated_rain": weather['rain_accum'],
-                   "accumulated_rain_valid": True,
-                   "rain_intensity": weather['rain_intensity'],
-                   "rain_intensity_valid": True,
-                   "dew_point_delta": weather['dew_point_margin'],
-                   "dew_point_delta_valid": True,
-                   "rg11_unsafe": rg11_unsafe,
-                   "rg11_unsafe_valid": True,
-                   "rg11_total": n_rg11,
-                   "rg11_total_valid": True,
-                   "dust_large": weather['dust_large'],
-                   "dust_large_valid": True,
-                   "dust_small": weather['dust_small'],
-                   "dust_small_valid": True,
-                   "light": weather['light'],
-                   "light_valid": True,
-                   "sky_temperature": weather['sky_temperature'],
-                   "sky_temperature_valid": True,
-                   "roof_state": roof_state,
-                   "roof_closed": closed}
+            ret = {
+                "date": date.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                "wind_dir": float(tree.find('./weather/wind_dir').text),
+                "wind_dir_valid": True,
+                "wind_speed": float(tree.find('./weather/wind_speed_avg').text),
+                "wind_speed_valid": True,
+                "temperature": float(tree.find('./weather/temperature').text),
+                "temperature_valid": True,
+                "relative_humidity": float(tree.find('./weather/humidity').text),
+                "relative_humidity_valid": True,
+                "pressure": float(tree.find('./weather/pressure').text),
+                "pressure_valid": True,
+                "dew_point_delta": float(tree.find('./weather/dew_point_margin').text),
+                "dew_point_delta_valid": True,
+                "rg11_unsafe": rg11_unsafe,
+                "rg11_unsafe_valid": True,
+                "rg11_total": len(rg11s),
+                "rg11_total_valid": True,
+                "dust_large": float(tree.find('./weather/dust_large').text),
+                "dust_large_valid": True,
+                "dust_small": float(tree.find('./weather/dust_small').text),
+                "dust_small_valid": True,
+                "light": float(tree.find('./weather/light').text),
+                "light_valid": True,
+                "sky_temperature": float(tree.find('./weather/sky_temperature').text),
+                "sky_temperature_valid": True,
+                "roof_state": roof_state,
+                "roof_closed": closed
+            }
 
             if self._query_error:
                 log.info('sentineld', 'Restored contact with Sentinel')
                 self._query_error = False
 
             with self._lock:
-                self._last_measurement = ret
                 self._last_measurement_date = now
+                self._last_measurement = ret
 
             return ret
         except Exception as exception:

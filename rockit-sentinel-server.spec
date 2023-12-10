@@ -6,7 +6,7 @@ Summary:   Sentinel feed client for the NGTS telescopes.
 License:   GPL-3.0
 Group:     Unspecified
 BuildArch: noarch
-Requires:  python3 python3-Pyro4 python3-requests python3-xml2dict python3-rockit-common
+Requires:  python3 python3-Pyro4 python3-requests python3-rockit-common
 
 %description
 
