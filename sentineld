@@ -15,15 +15,34 @@
 # You should have received a copy of the GNU General Public License
 # along with rockit.  If not, see <http://www.gnu.org/licenses/>.
 
-import datetime
 import threading
 import urllib.request
 import Pyro4
 import xml.etree.ElementTree as ET
+from astropy.time import Time
+import astropy.units as u
 from rockit.common import daemons, log
 
 SENTINEL_URI = 'http://10.2.5.16:5000/status'
 QUERY_TIMEOUT = 3
+
+AUTO_SENSORS = {
+    'wind_dir': './weather/wind_dir',
+    'wind_speed': './weather/wind_speed_avg',
+    'temperature': './weather/temperature',
+    'relative_humidity': './weather/humidity',
+    'pressure': './weather/pressure',
+    'dew_point_delta': './weather/dew_point_margin',
+    'dust_large': './weather/dust_large',
+    'dust_small': './weather/dust_small',
+    'light': './weather/light',
+    'sky_temperature': './weather/sky_temperature'
+}
+
+MANUAL_SENSORS = ['rg11_unsafe', 'rg11_total']
+
+# Only some of the RG11s are connected
+VALID_RG11S = [1, 2, 4]
 
 # pylint: disable=broad-except
 # pylint: disable=too-few-public-methods
@@ -35,89 +54,59 @@ class SentinelDaemon:
         self._query_error = False
 
         self._lock = threading.Lock()
-        self._last_measurement_date = None
-        self._last_measurement = None
+        self._data = {}
+        self._updated = {}
+        for k in list(AUTO_SENSORS.keys()) + MANUAL_SENSORS:
+            self._data[k] = 0
+            self._updated[k] = Time.now() - 1 * u.minute
 
     @Pyro4.expose
     def last_measurement(self):
-        """Query the latest valid measurement.
-        May return None if no data is available"""
-        now = datetime.datetime.now(datetime.timezone.utc)
+        """Query the latest valid measurement."""
+        with self._lock:
+            try:
+                with urllib.request.urlopen(SENTINEL_URI, timeout=QUERY_TIMEOUT) as response:
+                    sentinel_string = response.read()
+                    tree = ET.fromstring(sentinel_string)
 
-        # Rate limit queries to once per 10 seconds
-        if self._last_measurement_date and (now - self._last_measurement_date).total_seconds() < 10:
-            with self._lock:
-                return self._last_measurement
+                date = Time.strptime(tree.find('./weather/tsample').text, '%Y-%m-%d %H:%M:%S')
 
-        try:
-            with urllib.request.urlopen(SENTINEL_URI, timeout=QUERY_TIMEOUT) as response:
-                sentinel_string = response.read()
-                tree = ET.fromstring(sentinel_string)
+                for key, path in AUTO_SENSORS.items():
+                    value = tree.find(path).text
+                    if value and value != 'NULL':
+                        self._data[key] = float(value)
+                        self._updated[key] = date
 
-            # work out timestamp of data
-            date = datetime.datetime.strptime(tree.find('./weather/tsample').text, '%Y-%m-%d %H:%M:%S')
+                # Combine rg11 sensors
+                rg11_unsafe = 0
+                for r in VALID_RG11S:
+                    rg11_unsafe += int(tree.find(f'./weather/rg11_{r:02d}').text)
 
-            # combine rg11 sensors
-            rg11_total = 0
-            rg11s = [1, 2, 4]  # Only some of the sensors are connected
-            for r in rg11s:
-                rg11_total += int(tree.find(f'./weather/rg11_{r:02d}').text)
-            rg11_unsafe = 1 if rg11_total > 0 else 0
+                self._data['rg11_unsafe'] = rg11_unsafe
+                self._data['rg11_total'] = len(VALID_RG11S)
+                self._updated['rg11_unsafe'] = self._updated['rg11_total'] = date
 
-            # determine roof status
-            roof_state = tree.find('./roof/state').text
-            if roof_state == "FULL CLOSED":
-                closed = True
-            else:
-                closed = False
+                # Determine roof status
+                self._data['roof_state'] = tree.find('./roof/state').text
+                self._data['roof_closed'] = self._data['roof_state'] == "FULL CLOSED"
+                self._updated['roof_state'] = self._updated['roof_closed'] = date
 
-            ret = {
-                "date": date.strftime('%Y-%m-%dT%H:%M:%SZ'),
-                "wind_dir": float(tree.find('./weather/wind_dir').text),
-                "wind_dir_valid": True,
-                "wind_speed": float(tree.find('./weather/wind_speed_avg').text),
-                "wind_speed_valid": True,
-                "temperature": float(tree.find('./weather/temperature').text),
-                "temperature_valid": True,
-                "relative_humidity": float(tree.find('./weather/humidity').text),
-                "relative_humidity_valid": True,
-                "pressure": float(tree.find('./weather/pressure').text),
-                "pressure_valid": True,
-                "dew_point_delta": float(tree.find('./weather/dew_point_margin').text),
-                "dew_point_delta_valid": True,
-                "rg11_unsafe": rg11_unsafe,
-                "rg11_unsafe_valid": True,
-                "rg11_total": len(rg11s),
-                "rg11_total_valid": True,
-                "dust_large": float(tree.find('./weather/dust_large').text),
-                "dust_large_valid": True,
-                "dust_small": float(tree.find('./weather/dust_small').text),
-                "dust_small_valid": True,
-                "light": float(tree.find('./weather/light').text),
-                "light_valid": True,
-                "sky_temperature": float(tree.find('./weather/sky_temperature').text),
-                "sky_temperature_valid": True,
-                "roof_state": roof_state,
-                "roof_closed": closed
-            }
+                if self._query_error:
+                    log.info('sentineld', 'Restored contact with Sentinel')
+                    self._query_error = False
 
-            if self._query_error:
-                log.info('sentineld', 'Restored contact with Sentinel')
-                self._query_error = False
+                ret = {"date": date.strftime('%Y-%m-%dT%H:%M:%SZ')}
+                ret.update(self._data)
+                ret.update({k + '_valid': v > Time.now() - 1 * u.min for k, v in self._updated.items()})
+                return ret
+            except Exception as exception:
+                print(f'ERROR: failed to query from Sentinel: {exception}')
 
-            with self._lock:
-                self._last_measurement_date = now
-                self._last_measurement = ret
+                if not self._query_error:
+                    log.error('sentineld', 'Lost contact with Sentinel')
+                    self._query_error = True
 
-            return ret
-        except Exception as exception:
-            print(f'{now} ERROR: failed to query from Sentinel: {exception}')
-
-            if not self._query_error:
-                log.error('sentineld', 'Lost contact with Sentinel')
-                self._query_error = True
-
-            return None
+                return None
 
 
 if __name__ == '__main__':
