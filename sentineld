@@ -80,16 +80,20 @@ class SentinelDaemon:
                 # Combine rg11 sensors
                 rg11_unsafe = 0
                 for r in VALID_RG11S:
-                    rg11_unsafe += int(tree.find(f'./weather/rg11_{r:02d}').text)
+                    rg11_value = tree.find(f'./weather/rg11_{r:02d}').text
+                    if rg11_value and rg11_value != 'NULL':
+                        rg11_unsafe += int(rg11_value)
 
                 self._data['rg11_unsafe'] = rg11_unsafe
                 self._data['rg11_total'] = len(VALID_RG11S)
                 self._updated['rg11_unsafe'] = self._updated['rg11_total'] = date
 
                 # Determine roof status
-                self._data['roof_state'] = tree.find('./roof/state').text
-                self._data['roof_closed'] = self._data['roof_state'] == "FULL CLOSED"
-                self._updated['roof_state'] = self._updated['roof_closed'] = date
+                roof_state = tree.find('./roof/state').text
+                if roof_state and roof_state != 'NULL':
+                    self._data['roof_state'] = roof_state
+                    self._data['roof_closed'] = self._data['roof_state'] == "FULL CLOSED"
+                    self._updated['roof_state'] = self._updated['roof_closed'] = date
 
                 if self._query_error:
                     log.info('sentineld', 'Restored contact with Sentinel')
